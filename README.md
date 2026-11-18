@@ -15,13 +15,16 @@
 Python 3.10 以上が必要です。`pipx` または `pip` でワンコマンド導入できます。
 
 ```powershell
+# PyPI から導入する場合（推奨）
+pipx install discord-message-cli
+# または
+pip install discord-message-cli
+
 # GitHub リポジトリから直接導入する場合
 pipx install git+https://github.com/IT-Engineer-K/discord-message-cli.git
 
 # ローカルのクローンから導入する場合
 pipx install .
-# または開発モード
-pip install -e .
 ```
 
 ## 認証設定
