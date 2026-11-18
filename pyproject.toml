@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "discord-msg-cli"
+version = "0.1.0"
+description = "Read-only Discord channel message aggregation CLI for humans and AI agents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "tzdata; sys_platform == 'win32'",
+]
+
+[project.scripts]
+discord-msg = "discord_msg.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
