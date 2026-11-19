@@ -13,12 +13,14 @@ from typing import TextIO
 from . import __version__
 from .aggregator import Granularity, MessageFilter, aggregate_messages
 from .auth import DEFAULT_TOKEN_ENV, resolve_token
-from .client import HttpTransport, ReadOnlyDiscordClient, validate_channel_id
+from .client import HttpTransport, ReadOnlyDiscordClient, validate_channel_id, validate_message_content
 from .config import load_local_config
 from .errors import DiscordMsgError, ExitCode, InvalidArgumentsError
 from .formatter import (
     format_check_json,
     format_check_table,
+    format_send_json,
+    format_send_table,
     format_stats_json,
     format_stats_table,
 )
@@ -131,7 +133,65 @@ def build_parser() -> argparse.ArgumentParser:
         help="Perform case-insensitive matching for --prefix and --keyword.",
     )
 
+    # send subcommand
+    send_parser = subparsers.add_parser(
+        "send",
+        help="Send a message to the channel (mentions are disabled by default).",
+    )
+    _add_common_options(send_parser)
+    send_parser.add_argument(
+        "content",
+        nargs="?",
+        default=None,
+        help="Message text to send.",
+    )
+    send_parser.add_argument(
+        "-m",
+        "--message",
+        dest="message_opt",
+        default=None,
+        help="Message text to send (alternative to positional argument).",
+    )
+    send_parser.add_argument(
+        "--stdin",
+        action="store_true",
+        help="Read message text from standard input.",
+    )
+    send_parser.add_argument(
+        "--allow-mentions",
+        action="store_true",
+        help="Allow @everyone, @here, user, and role mentions (disabled by default).",
+    )
+
     return parser
+
+
+def _resolve_send_content(args: argparse.Namespace, stdin: TextIO) -> str:
+    if args.stdin and args.token_stdin:
+        raise InvalidArgumentsError("--stdin and --token-stdin cannot be used together.")
+
+    sources = [
+        args.content is not None,
+        args.message_opt is not None,
+        bool(args.stdin),
+    ]
+    if sum(sources) > 1:
+        raise InvalidArgumentsError(
+            "Specify message content using only one of positional argument, --message, or --stdin."
+        )
+    if sum(sources) == 0:
+        raise InvalidArgumentsError(
+            "Message content is required. Provide text as an argument, --message <TEXT>, or --stdin."
+        )
+
+    if args.stdin:
+        raw_content = stdin.read().rstrip("\r\n")
+    elif args.message_opt is not None:
+        raw_content = args.message_opt
+    else:
+        raw_content = args.content
+
+    return validate_message_content(raw_content)
 
 
 def _resolve_channel_id(
@@ -170,10 +230,16 @@ def run_cli(
     try:
         args = parser.parse_args(argv)
         if not args.subcommand:
-            raise InvalidArgumentsError("A subcommand is required ('check' or 'stats'). Run with --help for usage.")
+            raise InvalidArgumentsError(
+                "A subcommand is required ('check', 'stats', or 'send'). Run with --help for usage."
+            )
 
         local_cfg = load_local_config(args.config)
         channel_id = _resolve_channel_id(args.channel, environ, local_cfg.channel_id)
+
+        send_content: str | None = None
+        if args.subcommand == "send":
+            send_content = _resolve_send_content(args, in_stream)
 
         token = resolve_token(
             prompt_token=args.prompt_token,
@@ -240,6 +306,21 @@ def run_cli(
                 format_stats_json(report)
                 if args.format == "json"
                 else format_stats_table(report)
+            )
+            print(output, file=out_stream)
+            return int(ExitCode.OK)
+
+        if args.subcommand == "send":
+            assert send_content is not None
+            send_result = client.send_message(
+                channel_id,
+                send_content,
+                allow_mentions=bool(args.allow_mentions),
+            )
+            output = (
+                format_send_json(send_result)
+                if args.format == "json"
+                else format_send_table(send_result)
             )
             print(output, file=out_stream)
             return int(ExitCode.OK)

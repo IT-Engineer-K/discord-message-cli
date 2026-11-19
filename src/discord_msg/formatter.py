@@ -6,7 +6,7 @@ import json
 from typing import Any
 
 from .aggregator import AggregationReport
-from .client import CheckResult
+from .client import CheckResult, SendResult
 
 
 def format_check_json(result: CheckResult) -> str:
@@ -27,6 +27,29 @@ def format_check_table(result: CheckResult) -> str:
         f"Connection Check : {status}",
         f"Channel ID       : {result.channel_id}",
         f"History Access   : {history_state}",
+    ]
+    return "\n".join(lines)
+
+
+def format_send_json(result: SendResult) -> str:
+    payload: dict[str, Any] = {
+        "ok": True,
+        "channel_id": result.channel_id,
+        "message_id": result.message_id,
+        "timestamp": result.timestamp,
+        "mentions_allowed": result.mentions_allowed,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def format_send_table(result: SendResult) -> str:
+    mention_state = "Allowed" if result.mentions_allowed else "Disabled (default)"
+    lines = [
+        "Send Status      : OK",
+        f"Channel ID       : {result.channel_id}",
+        f"Message ID       : {result.message_id}",
+        f"Timestamp        : {result.timestamp}",
+        f"Mentions         : {mention_state}",
     ]
     return "\n".join(lines)
 

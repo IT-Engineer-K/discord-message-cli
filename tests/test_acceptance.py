@@ -53,14 +53,38 @@ class FakeDiscordTransport:
         self.messages = sorted(messages, key=lambda m: int(m["id"]), reverse=True)
         self.scripted_responses = list(scripted_responses) if scripted_responses else []
         self.calls: list[tuple[str, str, dict[str, str]]] = []
+        self.sent_payloads: list[dict[str, Any]] = []
 
-    def request(self, method: str, url: str, headers: dict[str, str], timeout: float) -> HttpResponse:
+    def request(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        timeout: float,
+        body: bytes | None = None,
+    ) -> HttpResponse:
         self.calls.append((method, url, headers))
-        if method != "GET":
-            raise AssertionError(f"Expected only GET requests, got {method}")
+        if method not in ("GET", "POST"):
+            raise AssertionError(f"Expected only GET or POST requests, got {method}")
 
         if self.scripted_responses:
             return self.scripted_responses.pop(0)
+
+        if method == "POST":
+            assert body is not None
+            payload = json.loads(body.decode("utf-8"))
+            self.sent_payloads.append(payload)
+            created = {
+                "id": "1308123456789012345",
+                "channel_id": FAKE_CHANNEL_ID,
+                "timestamp": "2026-11-19T04:55:00.000000+00:00",
+                "content": payload.get("content", ""),
+            }
+            return HttpResponse(
+                status=200,
+                headers={"content-type": "application/json"},
+                body=json.dumps(created).encode("utf-8"),
+            )
 
         parsed = urllib.parse.urlparse(url)
         query = urllib.parse.parse_qs(parsed.query)

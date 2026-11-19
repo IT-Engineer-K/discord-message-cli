@@ -7,10 +7,14 @@ import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from email.message import Message
 from pathlib import Path
+import urllib.request
+import urllib.response
 
 from discord_msg.cli import run_cli
-from discord_msg.errors import ExitCode
+from discord_msg.client import ReadOnlyDiscordClient, UrllibTransport, _NoRedirectHandler
+from discord_msg.errors import ExitCode, FetchInterruptedError
 from test_acceptance import FAKE_CHANNEL_ID, FAKE_TOKEN, JST, FakeDiscordTransport, make_fake_message
 
 
@@ -107,6 +111,111 @@ class TestCliOptionsAndAuth(unittest.TestCase):
         self.assertEqual(total_payload["total"], 3)
         self.assertEqual(len(total_payload["buckets"]), 1)
         self.assertEqual(total_payload["buckets"][0]["count"], 3)
+
+    def test_urllib_transport_never_follows_redirects_or_leaks_token(self) -> None:
+        """UrllibTransport must not follow 30x redirects so Authorization headers never leak."""
+        requested_urls: list[tuple[str, dict[str, str]]] = []
+
+        class _FakeRedirectHTTPSHandler(urllib.request.HTTPSHandler):
+            def https_open(self, req: urllib.request.Request) -> urllib.response.addinfourl:
+                requested_urls.append((req.full_url, dict(req.header_items())))
+                hdrs = Message()
+                hdrs["Location"] = "https://evil.example.invalid/steal-token"
+                hdrs["Content-Type"] = "application/json"
+                fp = io.BytesIO(b'{"message": "Moved"}')
+                resp = urllib.response.addinfourl(fp, hdrs, req.full_url, code=302)
+                resp.msg = "Found"
+                return resp
+
+        transport = UrllibTransport()
+        transport._opener = urllib.request.build_opener(_NoRedirectHandler, _FakeRedirectHTTPSHandler)
+
+        resp = transport.request(
+            "GET",
+            "https://discord.com/api/v10/channels/123456789012345678/messages?limit=1",
+            {"Authorization": f"Bot {FAKE_TOKEN}"},
+            timeout=5.0,
+        )
+        self.assertEqual(resp.status, 302)
+        self.assertEqual(len(requested_urls), 1, "Must not follow 302 redirect to secondary URL")
+        self.assertEqual(
+            requested_urls[0][0],
+            "https://discord.com/api/v10/channels/123456789012345678/messages?limit=1",
+        )
+
+        client = ReadOnlyDiscordClient(FAKE_TOKEN, transport=transport, diag_fn=lambda _: None)
+        with self.assertRaises(FetchInterruptedError):
+            client.check_channel_access(FAKE_CHANNEL_ID)
+        self.assertEqual(len(requested_urls), 2)
+
+    def test_send_message_disables_mentions_by_default_and_never_echoes_body(self) -> None:
+        """`send` must send allowed_mentions={'parse': []} by default and exclude message body from stdout/stderr."""
+        transport = FakeDiscordTransport([])
+        stdout, stderr = io.StringIO(), io.StringIO()
+        secret_msg = "@everyone @here <@123456> CONFIDENTIAL_POST_BODY_777"
+
+        code = run_cli(
+            ["send", "--channel", FAKE_CHANNEL_ID, secret_msg, "--format", "json"],
+            env={"DISCORD_BOT_TOKEN": FAKE_TOKEN},
+            stdout=stdout,
+            stderr=stderr,
+            transport=transport,
+        )
+        self.assertEqual(code, int(ExitCode.OK), stderr.getvalue())
+        self.assertEqual(len(transport.sent_payloads), 1)
+        sent = transport.sent_payloads[0]
+        self.assertEqual(sent["content"], secret_msg)
+        self.assertEqual(sent["allowed_mentions"], {"parse": []})
+
+        out_json = json.loads(stdout.getvalue())
+        self.assertTrue(out_json["ok"])
+        self.assertEqual(out_json["channel_id"], FAKE_CHANNEL_ID)
+        self.assertEqual(out_json["message_id"], "1308123456789012345")
+        self.assertFalse(out_json["mentions_allowed"])
+        self.assertNotIn("CONFIDENTIAL_POST_BODY_777", stdout.getvalue() + stderr.getvalue())
+        self.assertNotIn(FAKE_TOKEN, stdout.getvalue() + stderr.getvalue())
+
+    def test_send_message_with_allow_mentions_and_stdin(self) -> None:
+        """`send` supports --allow-mentions and --stdin, and rejects empty or >2000 char messages."""
+        transport = FakeDiscordTransport([])
+        stdout, stderr = io.StringIO(), io.StringIO()
+
+        code = run_cli(
+            ["send", "--channel", FAKE_CHANNEL_ID, "--stdin", "--allow-mentions", "--format", "json"],
+            env={"DISCORD_BOT_TOKEN": FAKE_TOKEN},
+            stdin=io.StringIO("Hello from stdin\n"),
+            stdout=stdout,
+            stderr=stderr,
+            transport=transport,
+        )
+        self.assertEqual(code, int(ExitCode.OK), stderr.getvalue())
+        self.assertEqual(len(transport.sent_payloads), 1)
+        sent = transport.sent_payloads[0]
+        self.assertEqual(sent["content"], "Hello from stdin")
+        self.assertEqual(sent["allowed_mentions"], {"parse": ["users", "roles", "everyone"]})
+        self.assertTrue(json.loads(stdout.getvalue())["mentions_allowed"])
+
+        # Empty message -> INVALID_ARGS
+        stdout, stderr = io.StringIO(), io.StringIO()
+        code = run_cli(
+            ["send", "--channel", FAKE_CHANNEL_ID, "   "],
+            env={"DISCORD_BOT_TOKEN": FAKE_TOKEN},
+            stdout=stdout,
+            stderr=stderr,
+            transport=transport,
+        )
+        self.assertEqual(code, int(ExitCode.INVALID_ARGS))
+
+        # >2000 characters -> INVALID_ARGS
+        stdout, stderr = io.StringIO(), io.StringIO()
+        code = run_cli(
+            ["send", "--channel", FAKE_CHANNEL_ID, "-m", "a" * 2001],
+            env={"DISCORD_BOT_TOKEN": FAKE_TOKEN},
+            stdout=stdout,
+            stderr=stderr,
+            transport=transport,
+        )
+        self.assertEqual(code, int(ExitCode.INVALID_ARGS))
 
 
 if __name__ == "__main__":

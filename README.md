@@ -1,12 +1,13 @@
 # Discord Message CLI (`discord-msg`)
 
-権限を持つ Discord チャンネルのメッセージを Discord 公式 HTTP API (v10) で**読み取り専用**で取得し、期間別の集計を行う CLI ツールです。  
-人がターミナルで表を確認するほか、AI エージェントやスクリプトが JSON 形式で安全に集計情報だけを取得できるように設計されています。
+権限を持つ Discord チャンネルのメッセージを Discord 公式 HTTP API (v10) で取得・期間別集計・投稿する CLI ツールです。  
+人がターミナルで表を確認するほか、AI エージェントやスクリプトが JSON 形式で安全に集計・投稿結果のメタデータだけを取得できるように設計されています。
 
 ## 特徴とセキュリティ方針
 
-- **読み取り専用**: `GET /channels/{channel_id}/messages` のみを使用し、投稿・編集・削除・権限変更の機能は一切持ちません。
-- **本文・添付の非出力**: 接続確認（`check`）および期間集計（`stats`）の出力（表・JSON ともに）には、メッセージ本文・添付ファイル・トークンを一切含めません。
+- **最小権限の API 操作**: メッセージ履歴の取得（`GET /channels/{channel_id}/messages`）とメッセージ投稿（`POST /channels/{channel_id}/messages`）のみを行い、削除や権限変更の機能は持ちません。また HTTP リダイレクトの自動追従を無効化し、トークンの外部漏えいを防ぎます。
+- **メンションは既定で無効**: `send` コマンドによる投稿時は、デフォルトで `allowed_mentions: {"parse": []}` を送信し、本文中に `@everyone`・`@here`・ユーザー/ロールメンションが含まれていても通知が飛ばない安全設計です（明示的に `--allow-mentions` を指定した場合のみ有効化）。
+- **本文・添付の非出力**: 接続確認（`check`）・期間集計（`stats`）・メッセージ投稿（`send`）の出力（表・JSON ともに）には、メッセージ本文・添付ファイル・トークンを一切含めません。
 - **安全なトークン入力**: Bot トークンは環境変数（`DISCORD_BOT_TOKEN`）、対話的な非表示入力（`--prompt-token`）、または標準入力（`--token-stdin`）からのみ受け付けます。コマンドライン引数や設定ファイルには保存・指定できません。
 - **標準出力と標準エラーの分離**: 診断メッセージやエラーはすべて標準エラー（`stderr`）に出力され、標準出力（`stdout`）には完全な結果（表または JSON）のみが出力されます。取得途中で失敗した場合は、不完全な集計を標準出力に出さず非ゼロ終了コードで終了します。
 
@@ -37,7 +38,7 @@ $env:DISCORD_BOT_TOKEN = (Read-Host -AsSecureString "Bot Token" | ConvertFrom-Se
 ```
 
 > **必要な Discord Bot 権限**:
-> 対象チャンネルに対する `View Channel`（チャンネルを見る）および `Read Message History`（メッセージ履歴を読む）。  
+> 対象チャンネルに対する `View Channel`（チャンネルを見る）、`Read Message History`（メッセージ履歴を読む・`check`/`stats` 用）、および `Send Messages`（メッセージを送信・`send` 用）。  
 > ※ 接頭辞（`--prefix`）やキーワード（`--keyword`）による本文絞り込みを行う場合は、Discord Developer Portal で Bot の **Message Content Intent** を有効にしてください。
 
 ## 使い方
@@ -131,6 +132,34 @@ JSON 出力例:
   ],
   "total": 5,
   "scanned_in_period": 8
+}
+```
+
+### 3. メッセージ投稿 (`send`)
+
+指定チャンネルにメッセージを投稿します。**デフォルトではすべてのメンション（`@everyone` / `@here` / ユーザー / ロール）が無効化**されます。
+
+```powershell
+# 位置引数または --message (-m) で投稿（メンションはデフォルト禁止）
+discord-msg send --channel 123456789012345678 "バッチ処理が完了しました"
+discord-msg send --channel 123456789012345678 -m "バッチ処理が完了しました" --format json
+
+# 標準入力から本文を渡して投稿
+"複数行のメッセージ" | discord-msg send --channel 123456789012345678 --stdin
+
+# メンションを明示的に許可する場合のみ --allow-mentions を指定
+discord-msg send --channel 123456789012345678 "@here 緊急アラート" --allow-mentions
+```
+
+JSON 出力例:
+
+```json
+{
+  "ok": true,
+  "channel_id": "123456789012345678",
+  "message_id": "1308123456789012345",
+  "timestamp": "2026-11-19T04:55:00.000000+00:00",
+  "mentions_allowed": false
 }
 ```
 

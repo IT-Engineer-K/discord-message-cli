@@ -1,4 +1,4 @@
-"""Read-only Discord HTTP API v10 client with pagination and rate-limit handling."""
+"""Discord HTTP API v10 client with pagination, message sending, and rate-limit handling."""
 
 from __future__ import annotations
 
@@ -24,8 +24,9 @@ from .errors import (
 from .time_utils import datetime_to_snowflake, parse_discord_timestamp
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
-USER_AGENT = "DiscordBot (https://github.com/IT-Engineer-K/discord-message-cli, 0.1.0)"
+USER_AGENT = "DiscordBot (https://github.com/IT-Engineer-K/discord-message-cli, 0.2.0)"
 PAGE_LIMIT = 100
+MAX_MESSAGE_LENGTH = 2000
 
 
 @dataclass(frozen=True)
@@ -36,20 +37,53 @@ class HttpResponse:
 
 
 class HttpTransport(Protocol):
-    def request(self, method: str, url: str, headers: dict[str, str], timeout: float) -> HttpResponse:
+    def request(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        timeout: float,
+        body: bytes | None = None,
+    ) -> HttpResponse:
         ...
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Disable automatic HTTP redirects so Authorization headers are never forwarded."""
+
+    def redirect_request(  # type: ignore[override]
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        return None
+
+
 class UrllibTransport:
-    """Standard-library HTTP transport restricted to GET requests."""
+    """Standard-library HTTP transport restricted to GET/POST requests with redirects disabled."""
 
-    def request(self, method: str, url: str, headers: dict[str, str], timeout: float) -> HttpResponse:
-        if method.upper() != "GET":
-            raise ValueError("Only read-only GET requests are allowed.")
+    def __init__(self) -> None:
+        self._opener = urllib.request.build_opener(_NoRedirectHandler)
 
-        req = urllib.request.Request(url, headers=headers, method="GET")
+    def request(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        timeout: float,
+        body: bytes | None = None,
+    ) -> HttpResponse:
+        method_upper = method.upper()
+        if method_upper not in ("GET", "POST"):
+            raise ValueError("Only GET and POST requests are allowed.")
+
+        req = urllib.request.Request(url, data=body, headers=headers, method=method_upper)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with self._opener.open(req, timeout=timeout) as resp:
                 resp_headers = {k.lower(): v for k, v in resp.headers.items()}
                 return HttpResponse(
                     status=resp.status,
@@ -90,6 +124,14 @@ class CheckResult:
     has_messages: bool
 
 
+@dataclass(frozen=True)
+class SendResult:
+    channel_id: str
+    message_id: str
+    timestamp: str
+    mentions_allowed: bool
+
+
 def validate_channel_id(channel_id: str) -> str:
     cleaned = channel_id.strip()
     if not cleaned or not cleaned.isdigit():
@@ -99,8 +141,18 @@ def validate_channel_id(channel_id: str) -> str:
     return cleaned
 
 
+def validate_message_content(content: str) -> str:
+    if not content or not content.strip():
+        raise InvalidArgumentsError("Message content must not be empty.")
+    if len(content) > MAX_MESSAGE_LENGTH:
+        raise InvalidArgumentsError(
+            f"Message content exceeds Discord's {MAX_MESSAGE_LENGTH}-character limit (got {len(content)} characters)."
+        )
+    return content
+
+
 class ReadOnlyDiscordClient:
-    """Read-only client for Discord REST API v10."""
+    """Client for Discord REST API v10 (read and message sending)."""
 
     def __init__(
         self,
@@ -133,15 +185,37 @@ class ReadOnlyDiscordClient:
         }
 
     def _get_json(self, path: str, query: dict[str, str] | None = None) -> Any:
+        return self._request_json("GET", path, query=query)
+
+    def _post_json(self, path: str, payload: dict[str, Any]) -> Any:
+        return self._request_json("POST", path, json_body=payload)
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        query: dict[str, str] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> Any:
         url = f"{self._base_url}{path}"
         if query:
             url = f"{url}?{urllib.parse.urlencode(query)}"
 
+        headers = self._headers()
+        body_bytes: bytes | None = None
+        if json_body is not None:
+            headers["Content-Type"] = "application/json"
+            body_bytes = json.dumps(json_body, ensure_ascii=False).encode("utf-8")
+
         attempts = 0
         while True:
-            resp = self._transport.request("GET", url, self._headers(), self._timeout)
+            if body_bytes is None and method == "GET":
+                resp = self._transport.request("GET", url, headers, self._timeout)
+            else:
+                resp = self._transport.request(method, url, headers, self._timeout, body_bytes)
 
-            if resp.status == 200:
+            if resp.status in (200, 201):
                 try:
                     return json.loads(resp.body.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -166,6 +240,11 @@ class ReadOnlyDiscordClient:
 
             if resp.status == 403:
                 api_msg = self._extract_api_error_detail(resp)
+                if method == "POST":
+                    raise PermissionDeniedError(
+                        f"Missing permission to send message to channel (403 Forbidden{api_msg}). "
+                        "Ensure the Bot has 'View Channel' and 'Send Messages' permissions."
+                    )
                 raise PermissionDeniedError(
                     f"Missing permission to access channel history (403 Forbidden{api_msg}). "
                     "Ensure the Bot has 'View Channel' and 'Read Message History' permissions."
@@ -176,7 +255,7 @@ class ReadOnlyDiscordClient:
 
             if 500 <= resp.status < 600:
                 raise FetchInterruptedError(
-                    f"Discord API server error ({resp.status}) while fetching messages."
+                    f"Discord API server error ({resp.status}) while contacting Discord API."
                 )
 
             api_msg = self._extract_api_error_detail(resp)
@@ -229,6 +308,42 @@ class ReadOnlyDiscordClient:
             reachable=True,
             history_readable=True,
             has_messages=len(payload) > 0,
+        )
+
+    def send_message(
+        self,
+        channel_id: str,
+        content: str,
+        *,
+        allow_mentions: bool = False,
+    ) -> SendResult:
+        """Send a message to the channel with mentions disabled by default."""
+        cid = validate_channel_id(channel_id)
+        validated_content = validate_message_content(content)
+
+        allowed_mentions: dict[str, Any] = (
+            {"parse": ["users", "roles", "everyone"]}
+            if allow_mentions
+            else {"parse": []}
+        )
+        body_payload: dict[str, Any] = {
+            "content": validated_content,
+            "allowed_mentions": allowed_mentions,
+        }
+        payload = self._post_json(f"/channels/{cid}/messages", body_payload)
+        if not isinstance(payload, dict):
+            raise FetchInterruptedError("Unexpected payload structure from Discord message creation endpoint.")
+
+        msg_id = str(payload.get("id", "")).strip()
+        raw_ts = payload.get("timestamp")
+        if not msg_id or not isinstance(raw_ts, str):
+            raise FetchInterruptedError("Created message response missing required 'id' or 'timestamp' field.")
+
+        return SendResult(
+            channel_id=cid,
+            message_id=msg_id,
+            timestamp=raw_ts,
+            mentions_allowed=allow_mentions,
         )
 
     def fetch_messages_in_window(
