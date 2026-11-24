@@ -9,11 +9,12 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from email.message import Message
 from pathlib import Path
+from unittest.mock import patch
 import urllib.request
 import urllib.response
 
 from discord_msg.cli import run_cli
-from discord_msg.client import ReadOnlyDiscordClient, UrllibTransport, _NoRedirectHandler
+from discord_msg.client import HttpResponse, ReadOnlyDiscordClient, UrllibTransport, _NoRedirectHandler
 from discord_msg.errors import ExitCode, FetchInterruptedError
 from test_acceptance import FAKE_CHANNEL_ID, FAKE_TOKEN, JST, FakeDiscordTransport, make_fake_message
 
@@ -216,6 +217,147 @@ class TestCliOptionsAndAuth(unittest.TestCase):
             transport=transport,
         )
         self.assertEqual(code, int(ExitCode.INVALID_ARGS))
+
+    def test_setup_saves_token_via_stdin_without_leaking(self) -> None:
+        """`setup --token-stdin` persists DISCORD_BOT_TOKEN without echoing it."""
+        saved: list[tuple[str, str]] = []
+        stdout, stderr = io.StringIO(), io.StringIO()
+
+        code = run_cli(
+            ["setup", "--token-stdin", "--format", "json"],
+            env={},
+            stdin=io.StringIO(f"Bot {FAKE_TOKEN}\n"),
+            stdout=stdout,
+            stderr=stderr,
+            set_env_fn=lambda name, val: saved.append((name, val)),
+        )
+        self.assertEqual(code, int(ExitCode.OK), stderr.getvalue())
+        self.assertEqual(saved, [("DISCORD_BOT_TOKEN", FAKE_TOKEN)])
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(
+            payload,
+            {
+                "ok": True,
+                "action": "saved",
+                "env_var": "DISCORD_BOT_TOKEN",
+                "scope": "User",
+            },
+        )
+        self.assertNotIn(FAKE_TOKEN, stdout.getvalue() + stderr.getvalue())
+
+    def test_setup_prompts_interactively_and_clears(self) -> None:
+        """`setup` prompts via getpass by default and supports `--clear`."""
+        saved: list[tuple[str, str]] = []
+        cleared: list[str] = []
+        stdout, stderr = io.StringIO(), io.StringIO()
+
+        with patch("discord_msg.auth.getpass.getpass", return_value=FAKE_TOKEN):
+            code = run_cli(
+                ["setup"],
+                env={},
+                stdout=stdout,
+                stderr=stderr,
+                set_env_fn=lambda name, val: saved.append((name, val)),
+            )
+        self.assertEqual(code, int(ExitCode.OK), stderr.getvalue())
+        self.assertEqual(saved, [("DISCORD_BOT_TOKEN", FAKE_TOKEN)])
+        self.assertIn("Setup Status     : OK (saved)", stdout.getvalue())
+        self.assertNotIn(FAKE_TOKEN, stdout.getvalue() + stderr.getvalue())
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        code = run_cli(
+            ["setup", "--clear", "--format", "json"],
+            env={},
+            stdout=stdout,
+            stderr=stderr,
+            clear_env_fn=lambda name: cleared.append(name),
+        )
+        self.assertEqual(code, int(ExitCode.OK), stderr.getvalue())
+        self.assertEqual(cleared, ["DISCORD_BOT_TOKEN"])
+        self.assertEqual(json.loads(stdout.getvalue())["action"], "cleared")
+
+    def test_setup_rejects_invalid_option_combinations_and_empty_token(self) -> None:
+        """`setup` rejects conflicting flags and empty tokens."""
+        for bad_args in (
+            ["setup", "--prompt-token", "--token-stdin"],
+            ["setup", "--clear", "--token-stdin"],
+            ["setup", "--clear", "--prompt-token"],
+        ):
+            stdout, stderr = io.StringIO(), io.StringIO()
+            code = run_cli(bad_args, env={}, stdout=stdout, stderr=stderr)
+            self.assertEqual(code, int(ExitCode.INVALID_ARGS))
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        code = run_cli(
+            ["setup", "--token-stdin"],
+            env={},
+            stdin=io.StringIO("   \n"),
+            stdout=stdout,
+            stderr=stderr,
+            set_env_fn=lambda _n, _v: None,
+        )
+        self.assertEqual(code, int(ExitCode.AUTH_FAILED))
+
+    def test_channels_lists_text_and_all_channels(self) -> None:
+        """`channels` lists text/announcement channels by default and all types with --all."""
+
+        class _FakeChannelsTransport:
+            def request(
+                self,
+                method: str,
+                url: str,
+                headers: dict[str, str],
+                timeout: float,
+                body: bytes | None = None,
+            ) -> HttpResponse:
+                if url.endswith("/users/@me/guilds?limit=200"):
+                    payload = [{"id": "111", "name": "Ops Server"}]
+                elif url.endswith("/guilds/111/channels"):
+                    payload = [
+                        {"id": "201", "name": "voice-room", "type": 2, "position": 2},
+                        {"id": "200", "name": "alerts", "type": 0, "position": 1},
+                        {"id": "199", "name": "category", "type": 4, "position": 0},
+                        {"id": "202", "name": "announcements", "type": 5, "position": 3},
+                    ]
+                else:
+                    raise AssertionError(f"Unexpected URL: {url}")
+                return HttpResponse(
+                    status=200,
+                    headers={"content-type": "application/json"},
+                    body=json.dumps(payload).encode("utf-8"),
+                )
+
+        transport = _FakeChannelsTransport()
+
+        # Default: text and announcement only
+        stdout, stderr = io.StringIO(), io.StringIO()
+        code = run_cli(
+            ["channels", "--format", "json"],
+            env={"DISCORD_BOT_TOKEN": FAKE_TOKEN},
+            stdout=stdout,
+            stderr=stderr,
+            transport=transport,
+        )
+        self.assertEqual(code, int(ExitCode.OK), stderr.getvalue())
+        data = json.loads(stdout.getvalue())
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["count"], 2)
+        self.assertEqual([c["channel_id"] for c in data["channels"]], ["200", "202"])
+        self.assertNotIn(FAKE_TOKEN, stdout.getvalue() + stderr.getvalue())
+
+        # --all with --guild and table output
+        stdout, stderr = io.StringIO(), io.StringIO()
+        code = run_cli(
+            ["channels", "--guild", "111", "--all"],
+            env={"DISCORD_BOT_TOKEN": FAKE_TOKEN},
+            stdout=stdout,
+            stderr=stderr,
+            transport=transport,
+        )
+        self.assertEqual(code, int(ExitCode.OK), stderr.getvalue())
+        self.assertIn("#alerts", stdout.getvalue())
+        self.assertIn("#voice-room", stdout.getvalue())
+        self.assertIn("#category", stdout.getvalue())
 
 
 if __name__ == "__main__":

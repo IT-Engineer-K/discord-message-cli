@@ -6,7 +6,16 @@ import json
 from typing import Any
 
 from .aggregator import AggregationReport
-from .client import CheckResult, SendResult
+from .auth import SetupResult
+from .client import (
+    ChannelInfo,
+    CheckResult,
+    MessageItem,
+    MessageListResult,
+    SendResult,
+    ThreadResult,
+    WaitResult,
+)
 
 
 def format_check_json(result: CheckResult) -> str:
@@ -120,4 +129,148 @@ def format_stats_table(report: AggregationReport) -> str:
     else:
         lines.append(f"Total       : {report.total_matched}")
 
+    return "\n".join(lines)
+
+
+def format_setup_json(result: SetupResult) -> str:
+    payload: dict[str, Any] = {
+        "ok": True,
+        "action": result.action,
+        "env_var": result.env_var,
+        "scope": result.scope,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def format_setup_table(result: SetupResult) -> str:
+    lines = [
+        f"Setup Status     : OK ({result.action})",
+        f"Environment Var  : {result.env_var}",
+        f"Scope            : {result.scope}",
+        "Note             : Open a new terminal for the change to take effect.",
+    ]
+    return "\n".join(lines)
+
+
+def format_channels_json(channels: list[ChannelInfo]) -> str:
+    payload: dict[str, Any] = {
+        "ok": True,
+        "count": len(channels),
+        "channels": [
+            {
+                "guild_id": ch.guild_id,
+                "guild_name": ch.guild_name,
+                "channel_id": ch.id,
+                "name": ch.name,
+                "type": ch.type_name,
+            }
+            for ch in channels
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def format_channels_table(channels: list[ChannelInfo]) -> str:
+    if not channels:
+        return "No accessible channels found."
+
+    headers = ("Guild", "Channel ID", "Name", "Type")
+    rows = [(ch.guild_name, ch.id, f"#{ch.name}", ch.type_name) for ch in channels]
+    widths = [
+        max(len(headers[i]), *(len(row[i]) for row in rows))
+        for i in range(4)
+    ]
+
+    sep = "+-" + "-+-".join("-" * w for w in widths) + "-+"
+    lines = [
+        sep,
+        "| " + " | ".join(headers[i].ljust(widths[i]) for i in range(4)) + " |",
+        sep,
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(row[i].ljust(widths[i]) for i in range(4)) + " |")
+    lines.append(sep)
+    return "\n".join(lines)
+
+
+def format_thread_json(result: ThreadResult) -> str:
+    return json.dumps(result.to_dict(), ensure_ascii=False, indent=2)
+
+
+def format_thread_table(result: ThreadResult) -> str:
+    lines = [
+        "Thread Status    : OK",
+        f"Thread ID        : {result.thread_id}",
+        f"Parent Channel   : {result.parent_channel_id}",
+        f"Source Message   : {result.source_message_id}",
+        f"Name             : {result.name}",
+    ]
+    if result.auto_archive_duration is not None:
+        lines.append(f"Auto Archive     : {result.auto_archive_duration} min")
+    return "\n".join(lines)
+
+
+def _format_message_rows(messages: list[MessageItem]) -> list[str]:
+    if not messages:
+        return ["(no messages)"]
+
+    headers = ("Message ID", "Timestamp", "Author", "Content")
+    rows: list[tuple[str, str, str, str]] = []
+    for msg in messages:
+        author_label = msg.author_display_name or msg.author_username or msg.author_id
+        if msg.author_id and author_label != msg.author_id:
+            author_label = f"{author_label} ({msg.author_id})"
+        single_line = " ".join(msg.content.splitlines())
+        if len(single_line) > 80:
+            single_line = single_line[:77] + "..."
+        rows.append((msg.message_id, msg.timestamp, author_label, single_line))
+
+    widths = [
+        max(len(headers[i]), *(len(row[i]) for row in rows))
+        for i in range(4)
+    ]
+    sep = "+-" + "-+-".join("-" * w for w in widths) + "-+"
+    lines = [
+        sep,
+        "| " + " | ".join(headers[i].ljust(widths[i]) for i in range(4)) + " |",
+        sep,
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(row[i].ljust(widths[i]) for i in range(4)) + " |")
+    lines.append(sep)
+    return lines
+
+
+def format_messages_json(result: MessageListResult) -> str:
+    return json.dumps(result.to_dict(), ensure_ascii=False, indent=2)
+
+
+def format_messages_table(result: MessageListResult) -> str:
+    lines = [
+        f"Channel/Thread ID : {result.channel_id}",
+        f"After             : {result.after or '(none)'}",
+        f"Cursor            : {result.cursor or '(none)'}",
+        f"Count             : {len(result.messages)}",
+        "",
+    ]
+    lines.extend(_format_message_rows(result.messages))
+    return "\n".join(lines)
+
+
+def format_wait_json(result: WaitResult) -> str:
+    return json.dumps(result.to_dict(), ensure_ascii=False, indent=2)
+
+
+def format_wait_table(result: WaitResult) -> str:
+    status = "TIMEOUT" if result.timed_out else "RECEIVED"
+    lines = [
+        f"Wait Status       : {status}",
+        f"Channel/Thread ID : {result.channel_id}",
+        f"After             : {result.after or '(none)'}",
+        f"Cursor            : {result.cursor or '(none)'}",
+        f"Polls / Elapsed   : {result.polls} poll(s) / {result.elapsed_seconds:.2f}s",
+        f"Count             : {len(result.messages)}",
+        "",
+    ]
+    lines.extend(_format_message_rows(result.messages))
     return "\n".join(lines)
